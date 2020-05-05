@@ -2,13 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 
 	"github.com/coreos/go-oidc"
-	"github.com/gorilla/handlers"
+	//"github.com/gorilla/handlers"
 	"github.com/julienschmidt/httprouter"
 	flag "github.com/spf13/pflag"
 )
@@ -18,11 +20,22 @@ type Claims struct {
 	Email string `json:"email"`
 }
 
+type LocalIpv4 struct {
+	ip   uint32
+	mask uint32
+}
+
 var (
 	// default flag values
 	authDomain = ""
+	allowLocal = false
 	address    = ""
 	port       = 80
+	localIpv4  = []LocalIpv4{
+		{0xa000000, 0xff000000},
+		{0xac100000, 0xfff00000},
+		{0xc0a80000, 0xffff0000},
+	}
 
 	// jwt signing keys
 	keySet oidc.KeySet
@@ -32,6 +45,7 @@ func init() {
 
 	// parse flags
 	flag.StringVar(&authDomain, "auth-domain", authDomain, "authentication domain (https://foo.cloudflareaccess.com)")
+	flag.BoolVar(&allowLocal, "allow-local", allowLocal, "allow local IPv4 addresses")
 	flag.IntVar(&port, "port", port, "http port to listen on")
 	flag.StringVar(&address, "address", address, "http address to listen on (leave empty to listen on all interfaces)")
 	flag.Parse()
@@ -58,8 +72,29 @@ func main() {
 	// listen
 	addr := fmt.Sprintf("%s:%d", address, port)
 	log.Printf("Listening on %s", addr)
-	log.Fatalln(http.ListenAndServe(addr, handlers.LoggingHandler(os.Stdout, router)))
+	log.Fatalln(http.ListenAndServe(addr, router)) // handlers.LoggingHandler(os.Stdout, router)))
 
+}
+
+func isLocalIpv4(ipv4 string) bool {
+	ipObj := net.ParseIP(ipv4)
+	if ipObj == nil {
+		return false
+	}
+
+	ipObj = ipObj.To4()
+	if ipObj == nil {
+		return false
+	}
+
+	ip := binary.BigEndian.Uint32(ipObj)
+	for _, localIp := range localIpv4 {
+		if (ip & localIp.mask) == localIp.ip {
+			return true
+		}
+	}
+
+	return false
 }
 
 func authHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -77,6 +112,11 @@ func authHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	//  Could also look in the cookies for CF_AUTHORIZATION
 	accessJWT := r.Header.Get("Cf-Access-Jwt-Assertion")
 	if accessJWT == "" {
+		var client_ip = r.Header.Get("X-Real-IP")
+		if client_ip != "" && allowLocal && isLocalIpv4(client_ip) {
+			write(w, http.StatusOK, "")
+			return
+		}
 		write(w, http.StatusUnauthorized, "No token on the request")
 		return
 	}
@@ -105,14 +145,16 @@ func authHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 
 	// Request is good to go
 	w.Header().Set("X-Auth-User", claims.Email)
-	write(w, http.StatusOK, "OK!")
+	write(w, http.StatusOK, "")
 
 }
 
 func write(w http.ResponseWriter, status int, body string) {
 	w.WriteHeader(status)
-	_, err := w.Write([]byte(body))
-	if err != nil {
-		log.Printf("Error writing body: %s\n", err)
+	if body != "" {
+		_, err := w.Write([]byte(body))
+		if err != nil {
+			log.Printf("Error writing body: %s\n", err)
+		}
 	}
 }
